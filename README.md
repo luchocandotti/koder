@@ -26,7 +26,7 @@ That is the whole idea. Everything else in this repository is the consequence of
 - **Extract archives on the server**: zip, tar, tar.gz/tgz, tar.bz2, gz, bz2. Path traversal inside the archive is rejected and the uncompressed size is capped before anything is written.
 - **Trash with an index** (`.koder-trash/.index.json`): anything you delete remembers where it came from and can be restored there.
 - **Live preview** of the folder's `index.php` / `index.html` in the second pane, with aggressive cache busting on every referenced asset, and an injected bridge that forwards the page's own errors to koder's console.
-- **Collect** (`collect.php`): concatenates the whole project into a single `project.txt`. That file is meant to be pasted into an LLM — it is how this editor was largely built.
+- **Collect** (`collect.php`): concatenates the whole project into a single txt, written to `KODER_DATA/collected/<folder>.txt` and opened in a tab. That file is meant to be pasted into an LLM — it is how this editor was largely built. It lands outside the web root on purpose; see the note in the Danger section.
 - **Zip export** of any root, **raw download**, drag-a-file-out-of-the-browser.
 - **Seven themes**, all of them just a block of CSS custom properties.
 - **Touch-first details that nobody ships**: long-press context menus, inertia-free custom scrollbars (the native ones fight CodeMirror's virtual rendering), single-axis scroll locking so the gutter stops chasing the text, a floating toolbar that follows `visualViewport` when the keyboard comes up, and an on-screen-keyboard lock for when a hardware keyboard is attached and iOS refuses to admit it.
@@ -50,6 +50,8 @@ app.css       tokens, layout, themes, CodeMirror theme
 ```
 
 The API is one file and one switch. Actions: `ls, read, save, lint, search, upload, extract, create, rename, move, trash, trashlist, restore, purge, indexfor, page, collect, zipcheck, zip, raw, roots, logout`. Everything is `POST` + JSON except `raw` and `zip`, which have to be navigations because that is how a browser downloads.
+
+The only things koder writes outside your project are in `KODER_DATA`: the password hash, sessions, rate-limit counters, approval requests and the collected txt files.
 
 State lives in `localStorage` under `editor.session`: open roots, tabs per pane, cursor positions, pane sizes, theme, pinned folders, toggles. There is no server-side state beyond the PHP session and, if you enable it, one pending-approval file.
 
@@ -158,7 +160,7 @@ It writes arbitrary files anywhere under `KODER_BASE`. On a PHP host, writing an
 - **The second factor is opt-in and needs something you build.** Out of the box this is still one password.
 - **No rate limit on the API itself**, and the audit log covers logins, not edits. Nothing records which file changed, or to what.
 - **`.htaccess` is Apache/LiteSpeed only.** On nginx those files are served as plain text unless you write the equivalent `location` blocks yourself. `project.txt` in particular is your entire codebase, publicly readable, including any secret you ever hardcoded.
-- **`project.txt` is a loaded gun.** It is generated inside the project folder, it includes `.env` and `.htaccess` by design, and it is one URL away from anyone who guesses the name. It is git-ignored here; keep it that way, and delete it when you are done.
+- **The collected txt is your whole codebase in one file.** It includes `.env` and `.htaccess` by design. Earlier versions wrote it next to the code, where it was one guessed URL away from anyone — it now goes to `KODER_DATA/collected/`, which is not served over the web at all. Do not move it back into a public folder to make it easier to reach, and delete the old `project.txt` files those earlier versions left behind.
 - **`lint` runs `shell_exec('php -n -l …')`.** The input is a temp file and the path is escaped, but if shelling out at all is unacceptable in your threat model, delete that action — JavaScript checking keeps working without it.
 - **CodeMirror and acorn load from a CDN without Subresource Integrity.** A compromised CDN response is a compromised editor with your session attached. Pinning the version helps; self-hosting the assets helps more. Doing that properly is an open issue and a good first contribution.
 - **No Content-Security-Policy.** The preview renders your own site inside an `iframe` with `srcdoc`, in the same origin as the editor, and injects a script into it on purpose.
