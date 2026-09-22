@@ -1,0 +1,25 @@
+# ── no cache: this is a tool, not a site ──
+<IfModule mod_headers.c>
+  Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+  Header set Pragma "no-cache"
+  Header set Expires "0"
+  Header unset ETag
+</IfModule>
+
+<IfModule mod_expires.c>
+  ExpiresActive Off
+</IfModule>
+
+<IfModule LiteSpeed>
+  CacheDisable public /
+</IfModule>
+
+FileETag None
+
+# ── internal files: never served, only included from PHP ──
+# NOTE: Apache/LiteSpeed only. On nginx you MUST write the equivalent
+# location rules yourself — see the README.
+<FilesMatch "^(\.ht(access|passwd)|project\.txt|(auth|login|head|wait|collect|config)\.php|config\.local\.php)$">
+  Require all denied
+</FilesMatch>
+.htaccess
