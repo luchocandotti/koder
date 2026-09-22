@@ -12,10 +12,12 @@ require_once __DIR__ . '/config.php';
 require_once __DIR__ . '/collect.php';
 require_once __DIR__ . '/auth.php';
 
-const BASE      = KODER_BASE;
-const MAX_BYTES = 4 * 1024 * 1024;     // bigger files are not opened
-const MAX_HITS  = 400;                 // search result ceiling
-const SKIP_DIRS = COLLECT_SKIP;
+const BASE        = KODER_BASE;
+const MAX_BYTES   = 4 * 1024 * 1024;     // bigger files are not opened
+const MAX_HITS    = 400;                 // search result ceiling
+const MAX_EXTRACT = 200 * 1024 * 1024;   // uncompressed ceiling (zip)
+const ARCH_RE     = '/\.(zip|tar|tar\.gz|tgz|tar\.bz2|tbz2?|gz|bz2)$/i';
+const SKIP_DIRS   = COLLECT_SKIP;
 
 const TEXT_EXT = ['php','html','htm','js','mjs','cjs','jsx','ts','tsx','css','scss','sass','less',
 	'json','md','markdown','txt','yml','yaml','xml','svg','sql','rb','erb','py','sh','bash','zsh',
@@ -99,6 +101,17 @@ function ext(string $name): string {
 function is_text(string $name): bool {
 		return in_array(ext($name), TEXT_EXT, true);
 }
+function uniq(string $dir, string $orig): string {
+		$name = $orig;
+		$n = 1;
+		$dot = strrpos($orig, '.');
+		while (file_exists($dir . '/' . $name)) {
+				$name = $dot !== false
+						? substr($orig, 0, $dot) . '~' . (++$n) . substr($orig, $dot)
+						: $orig . '~' . (++$n);
+		}
+		return $name;
+}
 
 switch ($action) {
 
@@ -158,6 +171,27 @@ case 'save': {
 		$bytes = file_put_contents($full, $body, LOCK_EX);
 		if ($bytes === false) fail('could not write', 500);
 		out(['ok' => true, 'path' => $full, 'bytes' => $bytes]);
+}
+
+/* ── check PHP syntax ───────────────────────── */
+case 'lint': {
+		$src = base64_decode((string)($in['b64'] ?? ''), true);
+		if ($src === false)           fail('invalid b64 content');
+		if (strlen($src) > MAX_BYTES) fail('file too large');
+
+		$tmp = tempnam(sys_get_temp_dir(), 'klint');
+		if ($tmp === false) fail('no temp files', 500);
+		file_put_contents($tmp, $src);
+		// -n ignores php.ini: no extensions or deprecations muddying the output
+		$raw = (string)@shell_exec('php -n -l ' . escapeshellarg($tmp) . ' 2>&1');
+		@unlink($tmp);
+
+		if (preg_match('/error:\s*(.+?) in .+ on line (\d+)/i', $raw, $m)) {
+				out(['ok' => false, 'line' => (int)$m[2],
+						 'msg' => preg_replace('/^syntax error,\s*/i', '', trim($m[1]))]);
+		}
+		if (stripos($raw, 'No syntax errors') !== false) out(['ok' => true]);
+		fail('the checker did not answer');
 }
 
 /* ── recursive search ───────────────────────── */
@@ -233,17 +267,65 @@ case 'upload': {
 		$orig = basename((string)$_FILES['file']['name']);
 		if ($orig === '') fail('invalid file name');
 
-		$name = $orig;
-		$n = 1;
-		while (file_exists($dir . '/' . $name)) {
-				$dot = strrpos($orig, '.');
-				$name = $dot !== false
-						? substr($orig, 0, $dot) . '~' . (++$n) . substr($orig, $dot)
-						: $orig . '~' . (++$n);
-		}
+		$name = uniq($dir, $orig);
 		$dest = $dir . '/' . $name;
 		if (!@move_uploaded_file($_FILES['file']['tmp_name'], $dest)) fail('could not save on the server (permissions)', 500);
 		out(['ok' => true, 'name' => $name]);
+}
+
+/* ── extract an archive on the server ───────── */
+case 'extract': {
+		$src = safe($in['path'] ?? '');
+		if (!is_file($src)) fail('not a file');
+		$base = basename($src);
+		if (!preg_match(ARCH_RE, $base, $m)) fail('unsupported format');
+		$kind = strtolower($m[1]);
+		$dir  = dirname($src);
+		$stem = substr($base, 0, -strlen($m[0])) ?: 'extracted';
+
+		// lone compressed file: .gz / .bz2 → one file
+		if ($kind === 'gz' || $kind === 'bz2') {
+				$w = $kind === 'gz' ? 'compress.zlib' : 'compress.bzip2';
+				if (!in_array($w, stream_get_wrappers(), true)) fail("$kind is not available in this PHP");
+				$out = $dir . '/' . uniq($dir, $stem);
+				if (!@copy("$w://$src", $out)) { @unlink($out); fail('could not decompress', 500); }
+				out(['ok' => true, 'name' => basename($out)]);
+		}
+
+		$out = $dir . '/' . uniq($dir, $stem);
+		if (!@mkdir($out, 0755)) fail('could not create the folder (permissions)', 403);
+		$tmp = null;
+		try {
+				if ($kind === 'zip') {
+						if (!class_exists('ZipArchive')) throw new Exception('ZipArchive is not available in this PHP');
+						$z = new ZipArchive();
+						if ($z->open($src) !== true) throw new Exception('broken or invalid zip');
+						$total = 0;
+						for ($i = 0; $i < $z->numFiles; $i++) {
+								$s = $z->statIndex($i);
+								if (preg_match('#(^|/)\.\.(/|$)|^/#', $s['name'])) throw new Exception('unsafe path: ' . $s['name']);
+								$total += $s['size'];
+						}
+						if ($total > MAX_EXTRACT) throw new Exception('extracted size exceeds ' . (MAX_EXTRACT >> 20) . ' MB');
+						if (!$z->extractTo($out)) throw new Exception('extraction failed');
+						$z->close();
+				} else {
+						if (!class_exists('PharData')) throw new Exception('PharData is not available in this PHP');
+						// Phar demands ".tar" in the name: tgz/tbz go through a temp copy
+						$alias = ['tgz' => 'tar.gz', 'tbz' => 'tar.bz2', 'tbz2' => 'tar.bz2'][$kind] ?? null;
+						if ($alias) {
+								$tmp = sys_get_temp_dir() . '/koder-' . bin2hex(random_bytes(6)) . '.' . $alias;
+								if (!@copy($src, $tmp)) throw new Exception('could not stage the archive');
+						}
+						(new PharData($tmp ?? $src))->extractTo($out, null, true);
+				}
+		} catch (Throwable $e) {
+				rmTree($out);
+				fail($e->getMessage());
+		} finally {
+				if ($tmp) @unlink($tmp);
+		}
+		out(['ok' => true, 'name' => basename($out)]);
 }
 
 /* ── create a file or folder ────────────────── */
@@ -258,14 +340,23 @@ case 'create': {
 		out(['ok' => true, 'path' => $full]);
 }
 
-/* ── rename ─────────────────────────────────── */
-case 'rename': {
+/* ── rename / move: the same rename() with another destination ── */
+case 'rename':
+case 'move': {
 		$path = safe($in['path'] ?? '');
-		$name = validName((string)($in['name'] ?? ''));
-		$dest = dirname($path) . '/' . $name;
+		if ($action === 'move') {
+			$dir = safe($in['dir'] ?? '');
+			if (!is_dir($dir)) fail('the destination is not a folder');
+			if (str_starts_with($dir . '/', $path . '/')) fail('cannot move a folder into itself');
+			$name = basename($path);
+		} else {
+			$dir  = dirname($path);
+			$name = validName((string)($in['name'] ?? ''));
+		}
+		$dest = rtrim($dir, '/') . '/' . $name;
 		if ($dest === $path) out(['ok' => true, 'path' => $path]);
 		if (file_exists($dest)) fail('already exists: ' . $name);
-		if (!@rename($path, $dest)) fail('could not rename (permissions)', 403);
+		if (!@rename($path, $dest)) fail('could not move (permissions)', 403);
 		out(['ok' => true, 'path' => $dest]);
 }
 
@@ -361,23 +452,41 @@ case 'indexfor': {
 		}
 		if ($file === null) out(['url' => null]);
 
-		// against the docroot, not against BASE: BASE may sit above
-		// public_html and anything above it is not served over the web
-		$doc = realpath((string)($_SERVER['DOCUMENT_ROOT'] ?? '')) ?: '';
-		if ($doc === '' || !($dir === $doc || str_starts_with($dir, rtrim($doc, '/') . '/')))
+		// the docroot comes from BASE: DOCUMENT_ROOT depends on which
+		// (sub)domain is serving koder, which may not be the site itself
+		$doc = realpath(BASE . '/public_html') ?: '';
+		if ($doc === '' || !($dir === $doc || str_starts_with($dir, $doc . '/')))
 				out(['url' => null, 'why' => 'this folder is outside the public site']);
 
 		$rel = ltrim(substr($dir, strlen($doc)), '/');
-		out(['url' => '/' . ($rel !== '' ? $rel . '/' : '') . $file]);
+		out(['url' => rtrim(KODER_SITE, '/') . '/' . ($rel !== '' ? $rel . '/' : '') . $file]);
+}
+
+/* ── fetch a page of the site (koder may live on another origin) ── */
+case 'page': {
+		$url = (string)($in['url'] ?? '');
+		if (!str_starts_with($url, rtrim(KODER_SITE, '/') . '/')) fail('url outside the site');
+		$c = curl_init($url . (str_contains($url, '?') ? '&' : '?') . 'kdr=' . time());
+		curl_setopt_array($c, [
+			CURLOPT_RETURNTRANSFER => true,
+			CURLOPT_FOLLOWLOCATION => true,
+			CURLOPT_TIMEOUT        => 15,
+			CURLOPT_HTTPHEADER     => ['Cache-Control: no-cache']
+		]);
+		$html = curl_exec($c);
+		$err  = curl_error($c);
+		curl_close($c);
+		if ($html === false) fail('could not fetch the page: ' . $err);
+		out(['html' => mb_scrub($html, 'UTF-8')]);
 }
 
 /* ── collect the code into project.txt ──────── */
 case 'collect': {
-    @set_time_limit(120);
-    $root = safe($in['root'] ?? '');
-    if (!is_dir($root)) fail('not a folder');
+		@set_time_limit(120);
+		$root = safe($in['root'] ?? '');
+		if (!is_dir($root)) fail('not a folder');
 		try { out(collect($root, $root . '/' . COLLECT_OUT)); }
-    catch (RuntimeException $e) { fail($e->getMessage(), 500); }
+		catch (RuntimeException $e) { fail($e->getMessage(), 500); }
 }
 
 /* ── check before navigating to the download ── */

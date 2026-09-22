@@ -1,6 +1,6 @@
 /* ───────────────────────────────────────────────
 	 editor — app.js
-	 ─────────────────────────────────────────────── */
+─────────────────────────────────────────────── */
 
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -32,17 +32,20 @@ async function api(action, body = {}) {
 /* ── state ─────────────────────────────────── */
 
 const LS = 'editor.session';
+const SIZES = { sidebar: 224, pane: 45, search: 220 };
 const S = {
 	roots: [],
 	active: '',
 	recent: [],
+	pinned: [],
 	wrap: false,
 	sidebar: true,
 	search: false,
+	log: false,
 	lockKb: false,
 	hidden: false,
 	theme: 'citric',
-	sizes: { sidebar: 224, pane: 45, search: 220 },
+	sizes: { ...SIZES },
 	cursors: {},
 	focus: 0
 };
@@ -59,32 +62,43 @@ const rootOf = p => S.roots.find(r => under(p, r)) || S.active;
 
 // returns the conflicting root, or undefined: either they are siblings, or it does not open
 const overlaps = p => S.roots.find(r => under(p, r) || under(r, p));
-
 const base = p => p.replace(/\/$/, '').split('/').pop() || p;
 
 // the .active class only matters with more than one folder
 const multi = () => S.roots.length > 1;
 
+const isPinned = p => S.pinned.includes(p);
+function togglePinned(p) {
+	S.pinned = isPinned(p) ? S.pinned.filter(x => x !== p) : [...S.pinned, p];
+	persist();
+}
+
 const FILES = new Map();   // path -> { master, savedGen, dirty, inUse }
 const PANES = [];          // { el, tabsEl, cm, tabs:[{path,name,doc}], active }
 const OPEN_DIRS = new Set();
 
+// the folder you tapped is where things get created and uploaded, not where
+// you search. The active root only changes if you tapped into another tree.
+let PICK = '';
+const target = () => (PICK && rootOf(PICK) === S.active) ? PICK : S.active;
+
 function pickDir(path) {
-	S.active = path;
-	$$('#tree .row.dir').forEach(r => r.classList.toggle('picked', r.dataset.path === path));
+	const r = rootOf(path);
+	if (r !== S.active) setActive(r);
+	PICK = path;
+	$$('#tree .row.dir').forEach(el => el.classList.toggle('picked', el.dataset.path === path));
 }
 const DIRS = new Map();   // path -> { el, kids, row, depth }
 
 function persist() {
 	localStorage.setItem(LS, JSON.stringify({
-		roots: S.roots, active: S.active, recent: S.recent, wrap: S.wrap, sidebar: S.sidebar,
-		search: S.search, lockKb: S.lockKb, hidden: S.hidden, theme: S.theme, sizes: S.sizes, cursors: S.cursors,
+		roots: S.roots, active: S.active, recent: S.recent, pinned: S.pinned, wrap: S.wrap, sidebar: S.sidebar,
+		search: S.search, log: S.log, lockKb: S.lockKb, hidden: S.hidden, theme: S.theme, sizes: S.sizes, cursors: S.cursors,
 		tabs: PANES.map(p => ({ paths: p.tabs.filter(t => !t.virtual).map(t => t.path), active: p.active }))
 	}));
 }
 
 /* ── icons per language ────────────────────── */
-
 const ICONS = {
 	php:  ['ph', '#8099d4'], html: ['ht', '#c4763a'], htm: ['ht', '#c4763a'],
 	js:   ['js', '#c4943a'], mjs:  ['js', '#c4943a'], cjs: ['js', '#c4943a'],
@@ -112,10 +126,7 @@ const MODES = {
 const modeFor = ext => MODES[ext] ?? null;
 
 /* ── autocomplete ──────────────────────────── */
-
-const PHP_WORDS = ('abstract array break callable case catch class clone const continue declare default do echo else elseif empty enum extends final finally fn for foreach function global if implements include include_once instanceof interface isset list match namespace new print private protected public readonly require require_once return static switch throw trait try unset use var while yield ' +
-	'array_filter array_key_exists array_keys array_map array_merge array_reduce array_slice array_values count implode in_array json_decode json_encode sprintf printf str_contains str_replace str_starts_with strlen strpos strtolower strtoupper substr trim rtrim ltrim preg_match preg_replace preg_split file_get_contents file_put_contents fopen fclose is_array is_dir is_file isset htmlspecialchars number_format date time usort uasort sort ksort ' +
-	'$_GET $_POST $_SERVER $_SESSION $_FILES $_COOKIE $this true false null').split(/\s+/);
+const PHP_WORDS = ('abstract array break callable case catch class clone const continue declare default do echo else elseif empty enum extends final finally fn for foreach function global if implements include include_once instanceof interface isset list match namespace new print private protected public readonly require require_once return static switch throw trait try unset use var while yield ' + 'array_filter array_key_exists array_keys array_map array_merge array_reduce array_slice array_values count implode in_array json_decode json_encode sprintf printf str_contains str_replace str_starts_with strlen strpos strtolower strtoupper substr trim rtrim ltrim preg_match preg_replace preg_split file_get_contents file_put_contents fopen fclose is_array is_dir is_file isset htmlspecialchars number_format date time usort uasort sort ksort ' + '$_GET $_POST $_SERVER $_SESSION $_FILES $_COOKIE $this true false null').split(/\s+/);
 
 function wordHint(cm, extra = []) {
 	const cur = cm.getCursor(), line = cm.getLine(cur.line);
@@ -160,8 +171,86 @@ function maybeHint(cm, change) {
 	cm.showHint({ hint, completeSingle: false, closeOnUnfocus: true });
 }
 
-/* ── scrollbar without inertia ─────────────── */
+/* ── syntax checking ───────────────────────── */
+// JS is parsed right here with acorn: milliseconds, no network.
+// PHP cannot be parsed in the browser, so it goes to api.php.
+// The lint addon draws the dot and the underline; we only
+// return { line, column, message }.
 
+const LINTERS = { js: lintJS, mjs: lintJS, cjs: lintJS, php: lintPHP };
+const BAD = new Set();   // paths with a syntax error, for the tree
+const paneOf = cm => PANES.find(p => p.cm === cm);
+
+// one error, one shape, wherever it came from
+function mark(cm, line, ch, msg) {
+	const len = cm.getLine(line)?.length ?? 0;
+	return [{
+		from: CodeMirror.Pos(line, ch == null ? 0 : Math.min(ch, len)),
+		to:   CodeMirror.Pos(line, ch == null ? len : Math.min(ch + 1, len)),
+		message: msg, severity: 'error'
+	}];
+}
+
+function lintJS(text, cm) {
+	let err = null;
+	for (const sourceType of ['script', 'module']) {
+		try {
+			acorn.parse(text, { ecmaVersion: 'latest', sourceType, locations: true, allowReturnOutsideFunction: true });
+			return [];
+		} catch (e) { err = err || e; }
+	}
+	return err.loc ? mark(cm, err.loc.line - 1, err.loc.column, err.message.replace(/\s*\(\d+:\d+\)$/, '')) : [];
+}
+
+async function lintPHP(text, cm) {
+	try {
+		const d = await api('lint', { b64: toB64(text) });
+		return d.ok ? [] : mark(cm, d.line - 1, null, d.msg);
+	} catch { return []; }   // no checker on the server: stay quiet
+}
+
+function lintSource(text, update, opts, cm) {
+	const pane = paneOf(cm);
+	const tab = pane?.tabs.find(t => t.path === pane.active);
+	const path = pane?.active;
+	const done = ann => {
+		if (pane) pane.lint = ann;
+		if (path) { ann.length ? BAD.add(path) : BAD.delete(path); markTree(); }
+		update(cm, ann);
+	};
+	if (!tab || tab.virtual) return done([]);
+	annotate(path, text, cm).then(done);
+}
+
+// the same verdict serves the gutter and the save
+function annotate(path, text, cm) {
+	const fn = path ? LINTERS[path.split('.').pop().toLowerCase()] : null;
+	return Promise.resolve(fn ? fn(text, cm) : []);
+}
+
+// there is no hover on an iPad: you tap the dot and read the error in the toast
+function showLint(cm, line) {
+	const a = (paneOf(cm)?.lint || []).find(x => x.from.line === line);
+	if (a) toast(a.message);
+}
+
+/* ── indent guides ─────────────────────────── */
+function guides(cm) {
+	const unit = () => cm.getOption('indentUnit');
+	const lvl = t => { const w = t.match(/^[\t ]*/)[0]; return w.split('\t').length - 1 + Math.floor(w.replace(/\t/g, '').length / unit()); };
+	const near = (n, d) => { for (let i = n + d; i >= 0 && i < cm.lineCount(); i += d) { const t = cm.getLine(i); if (t.trim()) return lvl(t); } return 0; };
+	// every line paints its own levels; blank ones inherit from their neighbours
+	cm.on('renderLine', (c, line, el) => {
+		const n = c.getLineNumber(line);
+		const k = line.text.trim() ? lvl(line.text) : Math.min(near(n, -1), near(n, 1));
+		if (!k) return;
+		el.classList.add('guides');
+		el.style.setProperty('--n', k);
+		el.style.setProperty('--gw', c.defaultCharWidth() * c.getOption('tabSize') + 'px');
+	});
+}
+
+/* ── scrollbar without inertia ─────────────── */
 function attachScrollbar(pane) {
 	const syncs = [axisBar(pane, 'y'), axisBar(pane, 'x')];
 	const sync = () => syncs.forEach(s => s());
@@ -239,47 +328,51 @@ function axisBar(pane, ax) {
 }
 
 /* ── cheat sheet ───────────────────────────── */
-
 const CHEAT_PATH = 'koder:shortcuts.md';
-
 const CHEAT = `# koder — shortcuts
 
 All of them with **Control**. On an Apple keyboard, Command does the same,
 except copy / cut / paste, which only work with Control.
 
-| key        | action                             |
-| ---------- | ---------------------------------- |
-| C / X / V  | copy, cut, paste                   |
-| Z / Y      | undo, redo                         |
-| A          | select all                         |
-| S          | save                               |
-| Shift + S  | export the folder as a zip         |
-| F          | search (bottom panel)              |
-| B          | show / hide the sidebar            |
-| K          | soft wrap or clipped lines         |
-| O          | open folder                        |
-| Shift + T  | open folder (same dialog)          |
-| Shift + A  | this sheet                         |
+| key        | action                               |
+| ---------- | ------------------------------------ |
+| C / X / V  | copy, cut, paste                     |
+| Z / Y      | undo, redo                           |
+| A          | select all                           |
+| S          | save                                 |
+| Shift + S  | export the folder as a zip           |
+| Shift + R  | tidy the interface back up           |
+| F          | search (bottom panel)                |
+| B          | show / hide the sidebar              |
+| K          | soft wrap or clipped lines           |
+| O          | open folder                          |
+| Shift + T  | open folder (same dialog)            |
+| Shift + A  | this sheet                           |
 | Shift + K  | lock / unlock the on-screen keyboard |
-| Shift + P  | preview the folder's index         |
-| W          | close tab                          |
-| N          | new file in the root               |
-| Shift + N  | new folder in the root             |
-| D          | open / close the second pane       |
-| , / .      | previous / next tab                |
-| E          | jump to the other pane             |
-| G          | go to a line                       |
-| Space      | autocomplete                       |
-| Escape     | close the search panel or dialog   |
+| Shift + P  | preview the folder's index           |
+| W          | close tab                            |
+| N          | new file in the root                 |
+| Shift + N  | new folder in the root               |
+| D          | open / close the second pane         |
+| , / .      | previous / next tab                  |
+| E          | jump to the other pane               |
+| G          | go to a line                         |
+| J          | error console                        |
+| Q          | fold / unfold the block              |
+| Shift + Q  | fold / unfold everything             |
+| Space      | autocomplete                         |
+| Escape     | close the search panel or dialog     |
 
 ## Without a keyboard
 
 Long press on a file or folder: rename, new file, new folder,
-convert indentation to tabs, move to trash.
+convert indentation to tabs, extract, move, move to trash.
 
 Long press on the empty part of the sidebar: create in the root.
 
 Long press on "trash": empty it.
+
+Long press on a folder inside the open-folder dialog: pin it to the top.
 
 The bar on the right of the editor drags without inertia.
 
@@ -312,9 +405,9 @@ function openCheatsheet() {
 }
 
 /* ── one axis per gesture ──────────────────── */
-   // a finger never travels perfectly straight: diagonal scrolling
-   // leaves the line-number column chasing the text. The first 6px
-   // of the gesture pick the axis and the other one freezes until release.
+// a finger never travels perfectly straight: diagonal scrolling
+// leaves the line-number column chasing the text. The first 6px
+// of the gesture pick the axis and the other one freezes until release.
 
 function lockAxis(cm) {
 	const sc = cm.getScrollerElement();
@@ -342,8 +435,7 @@ function lockAxis(cm) {
 	sc.addEventListener('touchend', () => { axis = null; }, { passive: true });
 }
 
-/* ── editor panes ───────────────────────────── */
-
+/* ── editor panes ──────────────────────────── */
 const EMPTIES = [
 	'works on my machine',
 	'// TODO: do the damn thing',
@@ -379,6 +471,10 @@ function buildPane(i) {
 		indentWithTabs: true,
 		smartIndent: true,
 		viewportMargin: 60,
+		gutters: ['CodeMirror-linenumbers', 'CodeMirror-lint-markers', 'CodeMirror-foldgutter'],
+		foldGutter: true,
+		foldOptions: { widget: '…', rangeFinder: CodeMirror.fold.combine(CodeMirror.fold.auto, CodeMirror.fold.indent) },
+		lint: { async: true, delay: 500, getAnnotations: lintSource },
 		readOnly: true,     // with no file open you cannot type
 		dragDrop: false,    // the drop is handled by the pane, not by CodeMirror
 		inputStyle: matchMedia('(any-hover:hover)').matches ? 'textarea' : 'contenteditable',
@@ -391,15 +487,19 @@ function buildPane(i) {
 			'Cmd-/': c => c.toggleComment(),
 			'Ctrl-/': c => c.toggleComment(),
 			'Tab': c => c.somethingSelected() ? c.indentSelection('add') : c.replaceSelection('\t', 'end'),
-			'Shift-Tab': c => c.indentSelection('subtract')
+			'Shift-Tab': c => c.indentSelection('subtract'),
+			'Ctrl-Q': 'toggleFold',
+			'Shift-Ctrl-Q': c => c.execCommand(c.getAllMarks().some(m => m.__isFold) ? 'unfoldAll' : 'foldAll')
 		}
 	});
 	cm.on('inputRead', maybeHint);
+	cm.on('gutterClick', showLint);
 	cm.on('beforeChange', tabsOnPaste);
 	applyKbLock({ cm });
 	cm.on('focus', () => setFocus(i));
 	cm.on('cursorActivity', () => trackCursor(i));
 	lockAxis(cm);
+	guides(cm);
 
 	const iframe = document.createElement('iframe');
 	iframe.className = 'preview-frame';
@@ -537,7 +637,7 @@ async function closeTab(pane, path) {
 	pane.tabs.splice(i, 1);
 
 	const stillOpen = PANES.some(p => p.tabs.some(t => t.path === path));
-	if (f && !stillOpen) { f.inUse = false; if (!f.dirty) FILES.delete(path); }
+	if (f && !stillOpen) { f.inUse = false; if (!f.dirty) FILES.delete(path); BAD.delete(path); }
 
 	if (path === PREVIEW_TAB && pane === PANES[1]) {
 		pane.active = null;
@@ -585,7 +685,7 @@ function renderTabs(pane) {
 			: (([label, color]) => `<span class="ico" style="color:${color}">${label}</span>`)(iconFor(t.name.split('.').pop().toLowerCase()));
 
 		el.innerHTML = icon +
-				`<span class="label">${tabLabel(t)}</span><span class="dot"></span><span class="x">×</span>`;
+			`<span class="label">${tabLabel(t)}</span><span class="dot"></span><span class="x">×</span>`;
 
 		el.addEventListener('mousedown', e => { if (e.button === 1) { e.preventDefault(); closeTab(pane, t.path); } });
 		el.addEventListener('click', e => {
@@ -615,6 +715,15 @@ async function saveActive() {
 	if (!pane?.active) return;
 	if (pane.tabs.find(t => t.path === pane.active)?.virtual) return toast('this is a reference sheet');
 	const f = FILES.get(pane.active);
+
+	// the gutter's verdict can lag behind: ask again, now
+	const bad = (await annotate(pane.active, f.master.getValue(), pane.cm))[0];
+	if (bad) {
+		const n = bad.from.line + 1;
+		const ok = await confirmBox(`Line ${n} — ${bad.message}`, 'Save anyway');
+		if (!ok) { jumpToLine(n); return; }
+	}
+
 	try {
 		await api('save', { path: pane.active, b64: toB64(f.master.getValue()) });
 		f.savedGen = f.master.changeGeneration(true);
@@ -625,7 +734,6 @@ async function saveActive() {
 }
 
 /* ── export folder ─────────────────────────── */
-
 async function exportFolder() {
 	const root = S.active;
 	if (!root) return toast('no folder open');
@@ -636,7 +744,6 @@ async function exportFolder() {
 }
 
 /* ── collect the code ──────────────────────── */
-
 async function collectCode() {
 	const row = $('#collectrow');
 	const root = S.active;
@@ -653,7 +760,6 @@ async function collectCode() {
 }
 
 /* ── context menu ──────────────────────────── */
-
 let menuEl = null;
 
 const MI = {
@@ -667,8 +773,12 @@ const MI = {
 	tabs:      '<polyline points="4 8 8 12 4 16"/><line x1="11" y1="6" x2="20" y2="6"/><line x1="11" y1="12" x2="20" y2="12"/><line x1="11" y1="18" x2="20" y2="18"/>',
 	trash:     '<path d="M4 7h16"/><path d="M9 7V4.5h6V7"/><path d="M6.5 7l1 13h9l1-13"/>',
 	restore:   '<path d="M4.5 11a7.5 7.5 0 1 1 2.2 5.3"/><polyline points="4.5 5.5 4.5 11 10 11"/>',
-	purge:     '<circle cx="12" cy="12" r="7.5"/><path d="M9.5 9.5l5 5M14.5 9.5l-5 5"/>'
+	purge:     '<circle cx="12" cy="12" r="7.5"/><path d="M9.5 9.5l5 5M14.5 9.5l-5 5"/>',
+	move:      '<path d="M3 7.5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M8.5 13.5h7M13 11l2.5 2.5L13 16"/>',
+	unzip:     '<rect x="4.5" y="3.5" width="15" height="17" rx="1.5"/><path d="M12 3.5v2M12 7.5v2M12 11.5v2"/><rect x="10.5" y="14.5" width="3" height="3" rx=".5"/>',
+	pin:       '<path d="M14.24 3.084a.75 .75 0 0 1 .53 .22l7.43 7.42a.75 .75 0 0 1 0 1.06c-.72 .72-1.61 .88-2.25 .88-.27 0-.5-.03-.69-.06l-4.7 4.7c.14.51.24 1.13.24 1.52.07 1.05-.05 2.53-1.08 3.56a.75 .75 0 0 1-1.06 0l-4.24-4.24-4.77 4.77c-.29.29-1.83 1.35-2.12 1.06-.29-.29 .77-1.83 1.06-2.12l4.77-4.77-4.24-4.24a.75 .75 0 0 1 0-1.06c1.03-1.03 2.51-1.15 3.56-1.08 .39 .02 1 .1 1.52 .24l4.7-4.7c-.03-.19-.06-.42-.06-.69 0-.64 .16-1.53 .88-2.25a.75 .75 0 0 1 .53-.22z"/>'
 };
+const ARCH = /\.(zip|tar|tar\.gz|tgz|tar\.bz2|tbz2?|gz|bz2)$/i;
 const miSvg = k => `<span class="mi">${MI[k] ? `<svg viewBox="0 0 24 24">${MI[k]}</svg>` : ''}</span>`;
 
 // stand-alone icons for the dialog and the folder headers
@@ -691,7 +801,7 @@ function showMenu(x, y, items, opts = {}) {
 	m.className = 'menu';
 	for (const it of items) {
 		const b = document.createElement('div');
-		b.className = 'menu-item' + (it.danger ? ' danger' : '');
+		b.className = 'menu-item' + (it.danger ? ' danger' : '') + (it.filled ? ' filled' : '');
 		b.innerHTML = miSvg(it.icon) + `<span>${it.label}</span>`;
 		b.addEventListener('click', () => { closeMenu(); it.run(); });
 		m.appendChild(b);
@@ -737,7 +847,6 @@ function bindMenu(el, build, opts = {}) {
 }
 
 /* ── confirm ───────────────────────────────── */
-
 function confirmBox(text, yesLabel = 'Delete') {
 	return new Promise(resolve => {
 		const box = $('#confirm');
@@ -758,7 +867,6 @@ function confirmBox(text, yesLabel = 'Delete') {
 }
 
 /* ── inline name editing in the sidebar ────── */
-
 function inlineEdit(row, initial, commit) {
 	const nameEl = $('.name', row);
 	const inp = document.createElement('input');
@@ -787,17 +895,14 @@ function inlineEdit(row, initial, commit) {
 }
 
 /* ── file operations ───────────────────────── */
-
 const parentOf = p => p.replace(/\/[^/]+\/?$/, '') || '/';
 
 function retargetTabs(oldPath, newPath) {
-	const f = FILES.get(oldPath);
-	if (f) { FILES.delete(oldPath); FILES.set(newPath, f); }
+	const map = p => under(p, oldPath) ? newPath + p.slice(oldPath.length) : p;
+	for (const [k, f] of [...FILES]) if (under(k, oldPath)) { FILES.delete(k); FILES.set(map(k), f); }
 	for (const p of PANES) {
-		for (const t of p.tabs) {
-			if (t.path === oldPath) { t.path = newPath; t.name = newPath.split('/').pop(); }
-		}
-		if (p.active === oldPath) p.active = newPath;
+		for (const t of p.tabs) if (under(t.path, oldPath)) { t.path = map(t.path); t.name = base(t.path); }
+		if (p.active) p.active = map(p.active);
 		renderTabs(p);
 	}
 	persist();
@@ -918,8 +1023,50 @@ async function indentToTabs(it) {
 	toast('converted — review it and save with ⌘S');
 }
 
+/* ── multiple selection ────────────────────── */
+const SEL = new Set();
+let ANCHOR = null;
+
+function paintSel() { $$('#tree .row[data-path]').forEach(r => r.classList.toggle('sel', SEL.has(r.dataset.path))); }
+function clearSel() { SEL.clear(); paintSel(); }
+
+// shift = range from the anchor · ⌘ = add/remove one · plain click = new anchor
+function selectClick(e, path) {
+	if (!e.shiftKey && !e.metaKey) { ANCHOR = path; if (SEL.size) clearSel(); return; }
+	e.stopImmediatePropagation();
+	if (e.metaKey) { SEL.has(path) ? SEL.delete(path) : SEL.add(path); ANCHOR = path; }
+	else {
+		const rows = $$('#tree .row[data-path]').filter(r => r.offsetParent).map(r => r.dataset.path);
+		const a = rows.indexOf(ANCHOR), b = rows.indexOf(path);
+		SEL.clear();
+		(a < 0 ? [path] : rows.slice(Math.min(a, b), Math.max(a, b) + 1)).forEach(p => SEL.add(p));
+	}
+	paintSel();
+}
+
+async function moveEntries(paths) {
+	// a folder drags its children along: nothing moves twice
+	paths = paths.filter(p => !S.roots.includes(p) && !paths.some(q => q !== p && under(p, q)));
+	if (!paths.length) return toast('cannot move a folder that is open');
+	const what = paths.length > 1 ? `${paths.length} items` : base(paths[0]);
+	openDialog({ verb: `move ${what} to`, run: async dir => {
+		const errs = [], touched = new Set([dir]);
+		for (const p of paths) {
+			try {
+				const r = await api('move', { path: p, dir });
+				retargetTabs(p, r.path);
+				touched.add(parentOf(p));
+			} catch (e) { errs.push(`${base(p)}: ${e.message}`); }
+		}
+		clearSel();
+		for (const d of touched) await reloadDir(d);
+		toast(errs.join(' · ') || `moved: ${what}`, errs.length ? '' : 'ok');
+	} });
+}
+
 function entryMenu(it, row) {
 	const dir = it.dir ? it.path : parentOf(it.path);
+	const sel = SEL.has(it.path) ? [...SEL] : [it.path];
 	const items = [
 		{ label: 'Rename', icon: 'rename', run: () => renameEntry(it, row) },
 		{ label: 'New file', icon: 'newfile', run: () => newEntry(dir, false) },
@@ -938,13 +1085,21 @@ function entryMenu(it, row) {
 			location.href = `${API}?a=raw&path=${encodeURIComponent(it.path)}`;
 		} });
 		items.push({ label: 'Indent with tabs', icon: 'tabs', run: () => indentToTabs(it) });
+		if (ARCH.test(it.path)) items.push({ label: 'Extract', icon: 'unzip', run: async () => {
+			toast('extracting…', 'up');
+			try {
+				const r = await api('extract', { path: it.path });
+				await reloadDir(parentOf(it.path));
+				toast(`done · ${r.name}`, 'ok');
+			} catch (e) { toast(e.message); }
+		} });
 	}
+	items.push({ label: sel.length > 1 ? `Move ${sel.length}` : 'Move', icon: 'move', run: () => moveEntries(sel) });
 	items.push({ label: 'Move to trash', icon: 'trash', danger: true, run: () => trashEntry(it) });
 	return items;
 }
 
 /* ── trash ─────────────────────────────────── */
-
 async function loadTrash() {
 	const root = S.active;
 	if (!root) return;
@@ -1049,6 +1204,7 @@ function closeRoot(root) {
 // the only door to the "active" state: nobody writes S.active by hand
 function setActive(root) {
 	S.active = root;
+	PICK = '';
 	$('#tree').classList.toggle('multi', multi());
 	$$('#tree .rootblock').forEach(b => b.classList.toggle('active', b.dataset.root === root));
 	$('#rootname').innerHTML = `<span class="appname">k/</span>${root ? base(root) : 'no folder'}`;
@@ -1070,6 +1226,7 @@ function rowFor(it, depth) {
 	row.className = 'row ' + (it.dir ? 'dir' : 'file');
 	row.style.paddingLeft = (8 + depth * 11) + 'px';
 	row.dataset.path = it.path;
+	row.addEventListener('click', e => selectClick(e, it.path));
 
 	if (it.dir) {
 		row.innerHTML = `<span class="chev">▶</span><span class="name">${it.name}</span>`;
@@ -1137,13 +1294,16 @@ function markTree() {
 		const p = r.dataset.path;
 		r.classList.toggle('active', p === current);
 		r.classList.toggle('loaded', open.has(p) && p !== current);
+		r.classList.toggle('broken', BAD.has(p));
 	});
 	syncPreviewRow();
 }
 
 /* ── search ────────────────────────────────── */
-
 let searchTimer;
+
+const gotoHit = (h, q) => openFile(h.file, S.focus, h.line, { col: h.col, q });
+
 function runSearch(commit = false) {
 	const q = $('#q').value.replace(/^[\r\n]+|[\s\r\n]+$/g, '');
 	const box = $('#results');
@@ -1164,7 +1324,6 @@ function runSearch(commit = false) {
 	api('search', { root: S.active, q }).then(d => {
 		if (!d.hits.length) { box.innerHTML = '<div class="res-note">no results</div>'; return; }
 		box.innerHTML = '';
-		const esc = s => s.replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
 		const first = q.split('\n')[0];
 		const rx = new RegExp(first.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'ig');
 
@@ -1175,19 +1334,55 @@ function runSearch(commit = false) {
 				`<span class="rel">${esc(h.rel)}</span>` +
 				`<span class="ln">${h.line}</span>` +
 				`<span class="tx">${esc(h.text).replace(rx, m => `<mark>${m}</mark>`)}</span>`;
-			row.addEventListener('click', () => openFile(h.file, S.focus, h.line, { col: h.col, q }));
+			row.addEventListener('click', () => gotoHit(h, q));
 			box.appendChild(row);
 		}
 		if (d.capped) box.insertAdjacentHTML('beforeend', '<div class="res-note">results truncated</div>');
+		// a single hit needs no list: go straight there
+		if (d.hits.length === 1 && !d.capped) gotoHit(d.hits[0], q);
 	}).catch(e => { box.innerHTML = `<div class="res-note">${e.message}</div>`; });
 }
 
 /* ── panes: show / hide / size ─────────────── */
-
 function toggleSidebar(force) {
 	S.sidebar = force ?? !S.sidebar;
 	$('#sidebar').hidden = !S.sidebar;
 	$('.gutter[data-resize="sidebar"]').hidden = !S.sidebar;
+	refreshAll(); persist();
+}
+
+const esc = s => String(s).replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c]));
+
+/* ── error console ─────────────────────────── */
+// every toast without a "kind" is an error or an odd notice: it stays
+// here, with a timestamp, so you can copy the whole thing and paste it
+// to whoever (or whatever) is helping you debug.
+
+const LOG = [];
+
+function logPush(msg) {
+	LOG.push({ t: new Date().toTimeString().slice(0, 8), msg: String(msg) });
+	if (LOG.length > 300) LOG.shift();
+	if (S.log) renderLog();
+}
+
+function logText() {
+	return LOG.map(l => `${l.t}  ${l.msg}`).join('\n');
+}
+
+function renderLog() {
+	const box = $('#logout');
+	if (!box) return;
+	box.innerHTML = LOG.length
+		? LOG.map(l => `<div class="res"><span class="ln">${l.t}</span><span class="tx">${esc(l.msg)}</span></div>`).join('')
+		: '<div class="res-note">no errors</div>';
+	box.scrollTop = box.scrollHeight;
+}
+
+function toggleLog(force) {
+	S.log = force ?? !S.log;
+	$('#log').hidden = !S.log;
+	if (S.log) renderLog();
 	refreshAll(); persist();
 }
 
@@ -1227,6 +1422,24 @@ function toggleWrap() {
 }
 
 function refreshAll() { PANES.forEach(p => { p.cm.refresh(); p.syncBar?.(); }); }
+
+/* ── interface reset ───────────────────────── */
+// after a while dragging gutters and opening things, the app ends up
+// misaligned. This puts it back to its starting shape without touching
+// tabs or files: sidebar up, search cleared, panes at their original size.
+
+function resetUI() {
+	toggleSidebar(true);
+	toggleSearch(true);
+	$('#q').value = '';
+	$('#results').innerHTML = '';
+	$('#tree').scrollTop = $('#sidebar').scrollTop = 0;
+	Object.assign(S.sizes, SIZES);
+	applySizes();
+	refreshAll(); persist();
+	PANES[S.focus]?.cm.focus();
+	toast('interface tidied up');
+}
 
 function applySizes() {
 	$('#sidebar').style.flexBasis  = S.sizes.sidebar + 'px';
@@ -1271,14 +1484,12 @@ function initResizers() {
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 /* ── open-folder dialog ────────────────────── */
-
 let DPATH = '/';
 let ROOTS = [];
 
 const isTouch = () => matchMedia('(hover:none)').matches;
 
 /* ── themes ────────────────────────────────── */
-
 const THEMES = [
 	{ id: 'citric',      label: 'Citric',      bg: '#1a1a18', text: '#c8c6bc', dim: '#6f6d64', accent: '#7aaa6a' },
 	{ id: '9009',        label: '9009',        bg: '#ebe8df', text: '#0c0d0d', dim: '#8e8976', accent: '#799878' },
@@ -1322,22 +1533,28 @@ function openThemeModal() {
 	$('#thememodal').hidden = false;
 }
 
-async function openDialog() {
+// pick = { verb, run }: the same dialog, but picking a destination
+let DPICK = null;
+async function openDialog(pick = null) {
+	DPICK = pick;
+	$('#dialog').classList.toggle('picking', !!pick);
 	$('#dialog').hidden = false;
 	$('#dpath').value = '';
-	$('#dhere').onclick = async () => {
-		const typed = $('#dpath').value.trim();
-		if (typed) return chooseDir(typed);
-		if (!DPATH) return alert('no folder to open');
-		chooseDir(DPATH);
+	const target = () => $('#dpath').value.trim() || DPATH;
+	$('#dhere').onclick = () => {
+		const t = target();
+		if (!t) return alert('no folder');
+		if (!DPICK) return chooseDir(t);
+		$('#dialog').hidden = true;
+		DPICK.run(t);
 	};
 	// with nothing open there is no "next to" anything
-	$('#dadd').hidden = !S.roots.length;
+	$('#dadd').hidden = !S.roots.length || !!pick;
 	$('#dadd').onclick = async () => {
-		const target = $('#dpath').value.trim() || DPATH;
-		if (!target) return alert('no folder to open');
+		const t = target();
+		if (!t) return alert('no folder to open');
 		$('#dialog').hidden = true;
-		await addRoot(target);
+		await addRoot(t);
 	};
 	if (!ROOTS.length) {
 		try { ROOTS = (await api('roots')).roots || []; }
@@ -1542,17 +1759,21 @@ async function browseTo(path) {
 		up.addEventListener('click', () => browseTo(parent));
 		list.appendChild(up);
 	}
-	const dirs = d.items.filter(i => i.dir);
+	// pinned folders float to the top of whatever folder you are in
+	const dirs = d.items.filter(i => i.dir).sort((a, b) => isPinned(b.path) - isPinned(a.path));
 	if (!dirs.length) list.insertAdjacentHTML('beforeend', '<div class="dnote">no subfolders</div>');
 	for (const it of dirs) {
 		const el = document.createElement('div');
-		el.className = 'drow';
+		el.className = 'drow' + (isPinned(it.path) ? ' pinned' : '');
 		el.innerHTML = `<span class="chev">▶</span><span class="name">${it.name}</span>`;
 		el.addEventListener('click', () => browseTo(it.path));
+		bindMenu(el, () => [
+			{ label: isPinned(it.path) ? 'Unpin' : 'Pin to top', icon: 'pin', filled: isPinned(it.path), run: () => { togglePinned(it.path); browseTo(DPATH); } }
+		]);
 		list.appendChild(el);
 	}
 	const nm = base(DPATH);
-	$('#dhere').innerHTML = `${DICO.open}<span class="label">open ${nm}</span>`;
+	$('#dhere').innerHTML = `${DICO.open}<span class="label">${DPICK?.verb || 'open'} ${nm}</span>`;
 	$('#dadd').innerHTML  = `${DICO.add}<span class="label">add ${nm}</span>`;
 }
 
@@ -1579,9 +1800,9 @@ function renderRecent() {
 }
 
 /* ── transient toast ───────────────────────── */
-
 let toastTimer;
 function toast(msg, kind = '') {
+	if (!kind) logPush(msg);
 	const t = $('#toast');
 	t.textContent = msg;
 	['ok', 'busy', 'up'].forEach(k => t.classList.toggle(k, kind === k));
@@ -1596,10 +1817,10 @@ function toast(msg, kind = '') {
 }
 
 /* ── lock the on-screen keyboard ───────────── */
-	 // iOS does not tell you whether a hardware keyboard is connected; this is
-	 // a manual switch via inputmode="none" on CodeMirror's real input field —
-	 // typing on an external keyboard keeps working, only the automatic
-	 // appearance of the virtual keyboard is turned off.
+// iOS does not tell you whether a hardware keyboard is connected; this is
+// a manual switch via inputmode="none" on CodeMirror's real input field —
+// typing on an external keyboard keeps working, only the automatic
+// appearance of the virtual keyboard is turned off.
 
 // files starting with a dot: api.php filters them out unless we ask for hidden
 function toggleHidden() {
@@ -1649,15 +1870,15 @@ function syncKbRow() {
 	$('#mobar [data-act="kb"]')?.classList.toggle('on', S.lockKb);
 }
 
-/* ── preview ────────────────────────────────── */
-	 // a virtual tab, same mechanism as shortcuts.md: no FILES entry,
-	 // no persistence, except that instead of a CodeMirror doc it shows
-	 // an iframe with the folder's real index.
-	 //
-	 // It always lives in the second pane — so its width is adjusted with
-	 // the same divider you already use between panes. If it ends up being
-	 // the only tab open in the whole app, it moves itself to the main pane
-	 // and the split closes.
+/* ── preview ───────────────────────────────── */
+// a virtual tab, same mechanism as shortcuts.md: no FILES entry, no
+// persistence, except that instead of a CodeMirror doc it shows an
+// iframe with the folder's real index.
+//
+// It always lives in the second pane — so its width is adjusted with the
+// same divider you already use between panes. If it ends up being the
+// only tab open in the whole app, it moves itself to the main pane and
+// the split closes.
 
 const PREVIEW_TAB = 'koder:preview';
 
@@ -1673,7 +1894,7 @@ async function openPreview() {
 	try { d = await api('indexfor', { path: dir }); }
 	catch (e) { return toast(e.message); }
 	if (!d.url) return toast(d.why || 'no index.php or index.html in this folder');
-
+	logPush(`preview → ${new URL(d.url, location.href).href}  (from ${location.origin})`);
 	showPreview('Preview', await fetchFreshHtml(d.url));
 }
 
@@ -1702,18 +1923,42 @@ function openImage(path) {
 	</style><img src="${rawUrl(path)}&kdr=${Date.now()}">`, true);
 }
 
+// runs inside the iframe (same origin as koder): whatever fails in there
+// reaches koder's own console instead of dying silently
+const PREVIEW_BRIDGE = '(' + (() => {
+	const L = m => parent.logPush?.('preview · ' + m);
+	addEventListener('error', e => {
+		const t = e.target;
+		L(t && t !== window
+			? `failed to load <${t.tagName.toLowerCase()}> ${t.currentSrc || t.src || t.href || ''}`
+			: `${e.message} (${e.filename}:${e.lineno})`);
+	}, true);
+	addEventListener('unhandledrejection', e => L('promise: ' + (e.reason?.message || e.reason)));
+	const play = HTMLMediaElement.prototype.play;
+	HTMLMediaElement.prototype.play = function () {
+		const r = play.call(this);
+		r?.catch?.(e => L(`play() rejected: ${e.name} — ${e.message}`));
+		return r;
+	};
+	const ce = console.error;
+	console.error = (...a) => { L(a.map(String).join(' ')); ce(...a); };
+}).toString() + ')()';
+
 // fetches the html with no cache and busts the cache of every local asset
 // (css/js/img) it references, so the iframe never shows stale files.
 async function fetchFreshHtml(url) {
-	const abs = location.origin + url;
-	const html = await fetch(abs, { cache: 'no-store' }).then(r => r.text());
+	const abs = new URL(url, location.href).href;
+	const html = abs.startsWith(location.origin + '/')
+		? await fetch(abs, { cache: 'no-store' }).then(r => r.text())
+		: (await api('page', { url: abs })).html;
 	const ts = Date.now();
 	const busted = html.replace(
 		/\s(src|href)=(["'])(?!https?:|data:|#|mailto:)([^"']+)\2/gi,
 		(m, attr, q, val) => ` ${attr}=${q}${val}${val.includes('?') ? '&' : '?'}kdr=${ts}${q}`
 	);
-	const base = abs.slice(0, abs.lastIndexOf('/') + 1);
-	return `<base href="${base}">` + busted;
+	const inject = `<base href="${abs.slice(0, abs.lastIndexOf('/') + 1)}"><script>${PREVIEW_BRIDGE}</script>`;
+	const head = /<head[^>]*>/i;
+	return head.test(busted) ? busted.replace(head, m => m + inject) : inject + busted;
 }
 
 function togglePreview() {
@@ -1744,7 +1989,6 @@ function syncPreviewRow() {
 }
 
 /* ── clipboard with Control ────────────────── */
-
 async function clipboard(kind, force = false) {
 	const cm = PANES[S.focus]?.cm;
 	if (!cm || (!force && !cm.hasFocus())) return;
@@ -1790,7 +2034,6 @@ function gotoLine() {
 }
 
 /* ── mobile bar ────────────────────────────── */
-
 function initMobar() {
 	const bar = $('#mobar');
 	if (!bar) return;
@@ -1800,11 +2043,11 @@ function initMobar() {
 		search:  () => toggleSearch(),
 		wrap:    () => toggleWrap(),
 		paste:   () => clipboard('v', true),
-		undo:    b => b._long ? (b._long = false) : PANES[S.focus]?.cm.undo(),
+		undo:     b => b._long ? (b._long = false) : PANES[S.focus]?.cm.undo(),
 		redo:    () => PANES[S.focus]?.cm.redo(),
 		save:    () => saveActive(),
 		fold:    () => { closeMenu(); bar.classList.toggle('folded'); },
-		kb:      b => b._long ? (b._long = false) : (S.lockKb ? summonKb() : toggleKbLock()),
+		kb:       b => b._long ? (b._long = false) : (S.lockKb ? summonKb() : toggleKbLock()),
 		refresh: () => location.reload(),
 	};
 
@@ -1868,7 +2111,6 @@ function initMobar() {
 }
 
 /* ── shortcuts ─────────────────────────────── */
-
 function initKeys() {
 	document.addEventListener('keydown', e => {
 		const mod = e.metaKey || e.ctrlKey;
@@ -1879,6 +2121,8 @@ function initKeys() {
 			if (!$('#dialog').hidden) { $('#dialog').hidden = true; return; }
 			if ($('#search').contains(document.activeElement)) { toggleSearch(false); PANES[S.focus].cm.focus(); return; }
 		}
+		// a modifier on its own is not a shortcut: it is half of one
+		if (['meta', 'control', 'shift', 'alt', 'capslock'].includes(k)) return;
 		if (!mod) return;
 
 		if (e.shiftKey && k === 't') { e.preventDefault(); return openDialog(); }
@@ -1887,23 +2131,29 @@ function initKeys() {
 		if (e.shiftKey && k === 'h') { e.preventDefault(); return toggleHidden(); }
 		if (e.shiftKey && k === 'p') { e.preventDefault(); return togglePreview(); }
 		if (e.shiftKey && k === 's') { e.preventDefault(); return exportFolder(); }
-		if (e.shiftKey && k === 'n') { e.preventDefault(); return newEntry(S.active, true); }
+		if (e.shiftKey && k === 'r') { e.preventDefault(); return resetUI(); }
+		if (e.shiftKey && k === 'n') { e.preventDefault(); return newEntry(target(), true); }
 		if (e.shiftKey) return;
 
+		// undo, redo, select all, comment, autocomplete, fold: CodeMirror
+		// resolves them in extraKeys — here we just stay out of the way
+		if (['z', 'y', 'a', '/', ' ', 'q'].includes(k)) return;
+
 		switch (k) {
-			case 'b': e.preventDefault(); toggleSidebar(); break;
-			case 'f': e.preventDefault(); toggleSearch(); break;
-			case 's': e.preventDefault(); saveActive(); break;
-			case 'k': e.preventDefault(); toggleWrap(); break;
-			case 'o': e.preventDefault(); openDialog(); break;
-			case 'w': e.preventDefault(); if (PANES[S.focus].active) closeTab(PANES[S.focus], PANES[S.focus].active); break;
-			case '\\': e.preventDefault(); toggleSplit(); break;
-			case 'n': e.preventDefault(); newEntry(S.active, false); break;
-			case 'd': e.preventDefault(); toggleSplit(); break;
-			case 'g': e.preventDefault(); gotoLine(); break;
-			case ',': e.preventDefault(); cycleTab(-1); break;
-			case '.': e.preventDefault(); cycleTab(1); break;
-			case 'c': case 'x': case 'v':
+			case 'b':  e.preventDefault(); toggleSidebar();           break;
+			case 'f':  e.preventDefault(); toggleSearch();            break;
+			case 's':  e.preventDefault(); saveActive();              break;
+			case 'k':  e.preventDefault(); toggleWrap();              break;
+			case 'o':  e.preventDefault(); openDialog();              break;
+			case 'w':  e.preventDefault(); if (PANES[S.focus].active) closeTab(PANES[S.focus], PANES[S.focus].active); break;
+			case '\\': e.preventDefault(); toggleSplit();             break;
+			case 'n':  e.preventDefault(); newEntry(target(), false); break;
+			case 'd':  e.preventDefault(); toggleSplit();             break;
+			case 'g':  e.preventDefault(); gotoLine();                break;
+			case 'j':  e.preventDefault(); toggleLog();               break;
+			case ',':  e.preventDefault(); cycleTab(-1);              break;
+			case '.':  e.preventDefault(); cycleTab(1);               break;
+			case 'c':  case 'x': case 'v':
 				if (e.ctrlKey && !e.metaKey) { e.preventDefault(); clipboard(k); }
 				break;
 			case 'e': {
@@ -1923,7 +2173,6 @@ function initKeys() {
 }
 
 /* ── boot ──────────────────────────────────── */
-
 (async function init() {
 	if (typeof CodeMirror === 'undefined') {
 		alert('CodeMirror did not load — check your connection to the CDN');
@@ -1945,7 +2194,7 @@ function initKeys() {
 	$('#collectrow').addEventListener('click', collectCode);
 	setFocus(0);
 
-	$('#rootbar').addEventListener('click', openDialog);
+	$('#rootbar').addEventListener('click', () => openDialog());
 
 	$('#trashrow').addEventListener('click', () => {
 		const el = $('#trashrow');
@@ -1964,8 +2213,8 @@ function initKeys() {
 			} }
 	]);
 	bindMenu($('#tree'), () => [
-		{ label: 'New file', icon: 'newfile', run: () => newEntry(S.active, false) },
-		{ label: 'New folder', icon: 'newfolder', run: () => newEntry(S.active, true) },
+		{ label: 'New file', icon: 'newfile', run: () => newEntry(target(), false) },
+		{ label: 'New folder', icon: 'newfolder', run: () => newEntry(target(), true) },
 		{ label: 'Add project', icon: 'plus', run: openDialog },
 		{ label: 'Download', icon: 'download', run: exportFolder }
 	], { skip: '.row, .roothead' });
@@ -1973,7 +2222,7 @@ function initKeys() {
 	$('#dpath').addEventListener('keydown', e => {
 		if (e.key !== 'Enter') return;
 		const v = $('#dpath').value.trim();
-		if (v) chooseDir(v); else $('#dialog').hidden = true;
+		if (v) $('#dhere').click(); else $('#dialog').hidden = true;
 	});
 
 	$('#dmore').addEventListener('click', () => {
@@ -2010,6 +2259,14 @@ function initKeys() {
 	$('.gutter[data-resize="sidebar"]').hidden = !S.sidebar;
 	$('#search').hidden = !S.search;
 	$('.gutter[data-resize="search"]').hidden = !S.search;
+	$('#log').hidden = !S.log;
+	if (S.log) renderLog();
+
+	$('#logclear').addEventListener('click', () => { LOG.length = 0; renderLog(); });
+	$('#logcopy').addEventListener('click', async () => {
+		try { await navigator.clipboard.writeText(logText()); toast('console copied', 'ok'); }
+		catch { toast('the browser blocked the clipboard'); }
+	});
 
 	const saved = JSON.parse(localStorage.getItem(LS) || '{}');
 	if (S.roots.length) {

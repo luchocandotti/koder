@@ -1,4 +1,4 @@
-<?php /* head.php — <head> shared by index.php and login.php. $editor = true adds CodeMirror. */ ?>
+<?php /* head.php — <head> shared by index.php, login.php and wait.php. $editor = true adds CodeMirror. */ ?>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -24,6 +24,7 @@
 <?php if (!empty($editor)): ?>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/hint/show-hint.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/lint/lint.min.css">
 <?php endif ?>
 <script>try{document.documentElement.dataset.theme=(JSON.parse(localStorage.getItem('editor.session')||'{}').theme)||'citric'}catch(e){}</script>
 <link rel="stylesheet" href="app.css?v=<?= @filemtime(__DIR__ . '/app.css') ?>">

@@ -291,7 +291,7 @@ body.bardrag, body.bardrag *{
 #dropzone[data-root]:not([data-root=""])::after{ content:" → " attr(data-root) }
 #dropzone:hover, #dropzone.dragover{ opacity:1 }
 #dropzone.dragover{ background:color-mix(in srgb, var(--amber) 12%, transparent) }
-@media (hover:none){ #dropzone{ display:none } }
+@media (hover:none) and (max-width:480px){ #dropzone{ display:none } }
 
 .row{
 	display:flex; align-items:center; gap:7px;
@@ -302,6 +302,7 @@ body.bardrag, body.bardrag *{
 }
 .row:hover{ background:var(--bg-hover) }
 .row.active{ background:var(--accent-soft); color:var(--accent-hi) }
+.row.sel{ background:color-mix(in srgb, var(--accent) 22%, transparent) }
 .row.dir.picked > .name{ color:var(--accent-hi) }
 .row.dir.dragover{ background:color-mix(in srgb, var(--amber) 16%, transparent); outline:1px dashed var(--amber); outline-offset:-1px }
 .row.drop{ background:var(--accent-soft) }
@@ -313,6 +314,9 @@ body.bardrag, body.bardrag *{
 .row.file.loaded{ background:none }
 .row.file.loaded .name{ color:#6d8a63 }
 .row.file.active .name{ color:var(--accent-hi) }
+.row.file.broken .ico,
+.row.file.broken .name{ color:var(--red) }
+.row.file.broken.active .name{ color:var(--red) }
 
 .chev{
 	flex:0 0 10px; color:var(--dimmer); font-size:9px;
@@ -431,15 +435,29 @@ body.bardrag, body.bardrag *{
 .hbar:hover .hthumb{ background:#4f4f47 }
 .hbar.on .hthumb{ background:var(--accent) }
 
-/* ── 6. search ─────────────────────────────── */
+/* ── 6. search (and the error console, same shell) ── */
 
-#search{
+#search, #log{
 	flex:0 0 220px; min-height:90px; min-width:0;
 	display:flex; flex-direction:column;
 	background:var(--bg);
 	border-top:.5px solid var(--line-soft);
 }
-#search[hidden]{ display:none }
+#search[hidden], #log[hidden]{ display:none }
+
+#log{ flex:0 0 190px }
+#logbar{
+	flex:0 0 auto; display:flex; align-items:center; gap:14px;
+	padding:9px 12px 7px; font-size:11px; color:var(--dim);
+	border-bottom:1px solid var(--line-soft);
+}
+#logtitle{ margin-right:auto; letter-spacing:.04em }
+#logcopy, #logclear{ cursor:pointer }
+#logcopy:hover, #logclear:hover{ color:var(--accent-hi) }
+#logout{ flex:1; overflow-y:auto; padding:4px 0 10px }
+#logout .res{ white-space:normal; align-items:flex-start }
+#logout .res .ln{ font-variant-numeric:tabular-nums }
+#logout .res .tx{ white-space:pre-wrap; color:var(--red) }
 
 #searchbar{ flex:0 0 auto; display:flex; padding:9px 12px 5px }
 
@@ -475,6 +493,9 @@ body.bardrag, body.bardrag *{
 	display:grid; place-items:start center; padding-top:22vh;
 }
 #dialog[hidden], #thememodal[hidden]{ display:none }
+/* picking a destination is not browsing: uploading and the recent list
+	 would only get in the way there */
+#dialog.picking #dupload, #dialog.picking #drecent{ display:none }
 
 .dialog-box{
 	width:min(520px,80vw); padding:4px;
@@ -508,6 +529,10 @@ body.bardrag, body.bardrag *{
 .drow:hover{ background:var(--bg-hover) }
 .drow .chev{ color:var(--dimmer); font-size:9px }
 .dnote{ padding:9px 12px; color:var(--dimmer); font-size:11px }
+
+/* pinned folders: first in the list, and marked so you can tell why */
+.drow.pinned .name{ font-weight:600 }
+.drow.pinned .chev{ color:var(--accent-hi) }
 
 #dhere, #dadd{ padding:9px 12px; color:var(--accent); border-radius:var(--r); cursor:default }
 
@@ -561,6 +586,8 @@ body.bardrag, body.bardrag *{
 .menu-item:hover{ background:var(--accent-soft); color:var(--accent-hi) }
 .menu-item.danger{ color:#a87a7a }
 .menu-item.danger:hover{ background:rgba(196,90,90,.14); color:var(--red) }
+/* an icon that is already "on": filled instead of outlined */
+.menu-item.filled .mi svg{ fill:currentColor }
 
 .menu-item .mi{ flex:0 0 15px; height:15px; color:var(--dimmer) }
 .menu-item:hover .mi{ color:var(--accent) }
@@ -593,7 +620,7 @@ body.bardrag, body.bardrag *{
 .confirm-acts button.danger{ border-color:#553a3a; color:#bd8383 }
 .confirm-acts button.danger:hover{ background:rgba(196,90,90,.14); color:var(--red) }
 
-/* ── login (login.php) ─────────────────────── */
+/* ── login (login.php) and the waiting screen (wait.php) ── */
 
 body.login{ display:grid; place-items:center }
 .login-wrap{ display:grid; justify-items:center; gap:20px }
@@ -614,6 +641,11 @@ body.login{ display:grid; place-items:center }
 }
 .login-box p{ color:var(--red); font-size:12px }
 .login-box p.hint{ color:var(--dim) }
+/* the four digits you have to match against the approving device */
+.k0dr-code{
+	font:600 34px/1 var(--mono); letter-spacing:.22em;
+	text-align:center; color:var(--accent-hi); padding:6px 0 2px;
+}
 .login-box input{
 	padding:9px 10px; border:1px solid var(--line); border-radius:var(--r);
 	background:var(--bg-deep); caret-color:var(--accent-hi);
@@ -669,6 +701,40 @@ body.login{ display:grid; place-items:center }
 .cm-s-claude .CodeMirror-matchingbracket{ color:var(--accent-hi) !important; border-bottom:1px solid var(--accent) }
 .cm-s-claude .CodeMirror-nonmatchingbracket{ color:var(--red) !important }
 .cm-s-claude .CodeMirror-lines{ padding-bottom:calc(24px + env(safe-area-inset-bottom)) }
+
+/* indent guides: one repeating hairline per level, painted by the line
+	 itself (app.js sets --n and --gw per line, see guides()) */
+.cm-s-claude .CodeMirror-line.guides{
+	background:repeating-linear-gradient(90deg, var(--line) 0 1px, transparent 1px var(--gw)) 0 0 / calc(var(--gw) * var(--n)) 100% no-repeat content-box;
+}
+
+/* folding */
+.CodeMirror-foldgutter{ width:14px }
+.CodeMirror-foldgutter-open,
+.CodeMirror-foldgutter-folded{ color:var(--dim); font-size:12px; text-align:center; cursor:pointer }
+.CodeMirror-foldgutter-folded{ color:var(--accent-hi) }
+.CodeMirror-foldgutter-open::after{ content:'▾' }
+.CodeMirror-foldgutter-folded::after{ content:'▸' }
+.cm-s-claude .CodeMirror-foldmarker{
+	color:var(--dim); background:var(--bg-hover); border-radius:3px;
+	padding:0 4px; cursor:pointer;
+}
+
+/* syntax errors: a dot in the gutter, an underline on the line */
+.CodeMirror-lint-markers{ width:14px }
+.CodeMirror-lint-marker-error{
+	background-image:none; color:var(--red);
+	font-size:9px; line-height:16px; text-align:center;
+}
+.CodeMirror-lint-marker-error::after{ content:'●' }
+.cm-s-claude .CodeMirror-lint-mark-error{
+	background-image:none; border-bottom:1.5px dotted var(--red);
+}
+.CodeMirror-lint-tooltip{
+	background:var(--bg-side); border:1px solid var(--line); border-radius:var(--r);
+	color:var(--text); font:400 12px/1.45 var(--mono);
+	padding:5px 8px; max-width:60vw; z-index:70;
+}
 
 /* selection: green wherever CodeMirror draws it itself (textarea mode:
 	 always on desktop, on iPad when a trackpad/mouse is connected).

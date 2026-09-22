@@ -3,13 +3,14 @@ declare(strict_types=1);
 
 /* ───────────────────────────────────────────────
    auth.php — koder's login (single user).
+   Replaces Basic Auth: exponential backoff, SameSite=Lax session.
 
-   Data lives outside the document root: api.php (BASE = the site)
-   cannot reach it, so nobody inside koder can delete the password
-   or reopen the setup screen.
+   Credentials live in KODER_DATA. Put that folder outside the web root,
+   and outside KODER_BASE if you can: then nobody who gets into koder can
+   delete the password and reopen the setup screen.
 
    With no pass.json the login screen asks you to define a password.
-   Create it BEFORE removing any Basic Auth you had in front.
+   Create it BEFORE removing whatever guarded this folder until now.
    ─────────────────────────────────────────────── */
 
 require_once __DIR__ . '/config.php';
@@ -19,6 +20,8 @@ define('K_PASS', K_DATA . '/pass.json');
 const K_TTL = 60 * 60 * 24 * 30;                          // session: 30 days since last use
 const K_RL  = ['free' => 5, 'base' => 30, 'max' => 3600]; // free tries · first lockout · ceiling (seconds)
 const K_MIN = 16;                                         // minimum password length
+const K_2FA_TTL = 90;                                     // seconds an approval request stays alive
+const K_NONCE   = 'koder_wait';                           // cookie tying a request to one browser
 
 function k_read(string $f): array {
 	$j = is_file($f) ? json_decode((string)@file_get_contents($f), true) : null;
@@ -56,8 +59,8 @@ function k_session(): void {
 	if (session_status() !== PHP_SESSION_ACTIVE) session_start();
 }
 
-/** Valid session? Renews the expiry (server side too: we don't rely on GC)
- *  and releases the lock, otherwise parallel requests queue up. */
+/** Valid session? Renews the expiry (server side too: we do not rely on GC)
+ *  and releases the lock — otherwise parallel requests queue up. */
 function k_authed(): bool {
 	k_session();
 	$ok = !empty($_SESSION['koder']) && time() - ($_SESSION['seen'] ?? 0) < K_TTL;
@@ -107,6 +110,56 @@ function k_human(int $s): string {
 	return $m . ' minute' . ($m === 1 ? '' : 's');
 }
 
+/* ── second factor: approval from outside ───── */
+	 // The request lives in KODER_DATA as pending.json. Whoever is on the
+	 // other side of the login has no session yet, so they cannot touch it
+	 // through the API: the only way to approve is the companion app.
+	 // See "Two-factor approval" in the README for the file contract.
+
+function k_pending_file(): string { return K_DATA . '/pending.json'; }
+
+/** The live request, or [] if there is none or it expired. */
+function k_pending_read(): array {
+	$d = k_read(k_pending_file());
+	if (!$d || (int)($d['at'] ?? 0) + K_2FA_TTL < time()) return [];
+	return $d;
+}
+
+/** Opens a request and hands THIS browser the nonce that identifies it. */
+function k_pending_new(): array {
+	$nonce = bin2hex(random_bytes(16));
+	$d = [
+		'code' => str_pad((string)random_int(0, 9999), 4, '0', STR_PAD_LEFT),
+		'ip'   => $_SERVER['REMOTE_ADDR'] ?? '',
+		'ua'   => substr((string)($_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 160),
+		'at'   => time(),
+		'hash' => hash('sha256', $nonce),
+		'ok'   => false,
+	];
+	k_write(k_pending_file(), $d);
+	setcookie(K_NONCE, $nonce, ['expires' => time() + K_2FA_TTL] + k_cookie());
+	return $d;
+}
+
+/** The live request, but only if this browser opened it. Without this,
+ *  approving would let in whoever asked last, not necessarily you. */
+function k_pending_mine(): array {
+	$d = k_pending_read();
+	$nonce = (string)($_COOKIE[K_NONCE] ?? '');
+	if (!$d || $nonce === '' || !hash_equals((string)$d['hash'], hash('sha256', $nonce))) return [];
+	return $d;
+}
+
+function k_pending_clear(): void {
+	@unlink(k_pending_file());
+	setcookie(K_NONCE, '', ['expires' => 1] + k_cookie());
+}
+
+/** The audit log koder never had. Append only. */
+function k_log(string $line): void {
+	@file_put_contents(K_DATA . '/approvals.log', date('c') . '  ' . $line . "\n", FILE_APPEND | LOCK_EX);
+}
+
 /* ── gatekeeper for index.php ───────────────── */
 
 function k_same_origin(): bool {
@@ -136,11 +189,23 @@ function k_gate(): void {
 		elseif (!password_verify($p, $hash)) { k_fail(); $error = 'wrong password'; }
 
 		if ($error === '') {
-			k_start();
-			header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'), true, 303);
+			// Setup run has nobody to ask yet: the password IS the enrolment.
+			if ($setup || !KODER_2FA) {
+				k_start();
+				header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'), true, 303);
+				exit;
+			}
+			$pending = k_pending_new();
+			k_log('requested ' . $pending['code'] . ' from ' . $pending['ip'] . ' — ' . $pending['ua']);
+			require __DIR__ . '/wait.php';
 			exit;
 		}
 	}
+
+	// Reloading with a live request of your own keeps waiting instead of
+	// asking for the password again.
+	if (KODER_2FA && ($pending = k_pending_mine())) { require __DIR__ . '/wait.php'; exit; }
+
 	require __DIR__ . '/login.php';
 	exit;
 }
