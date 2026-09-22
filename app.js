@@ -753,8 +753,11 @@ async function collectCode() {
 	toast('collecting…', 'busy');
 	try {
 		const d = await api('collect', { root });
-		toast(`project.txt  ${d.files} files`, 'ok');
-		if (!$$('#tree .row').some(r => r.dataset.path === d.path)) await reloadDir(root);
+		// it no longer lives in the tree: open it straight away, which is the
+		// only thing you ever did with it. If KODER_DATA sits outside
+		// KODER_BASE, the path is all we can offer.
+		if (d.open) { await openFile(d.path); toast(`${base(d.path)}  ${d.files} files`, 'ok'); }
+		else toast(`${d.files} files in ${d.path}`, 'ok');
 	} catch (e) { toast(e.message); }
 	finally { row.classList.remove('on'); }
 }

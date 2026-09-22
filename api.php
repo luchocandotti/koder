@@ -480,13 +480,31 @@ case 'page': {
 		out(['html' => mb_scrub($html, 'UTF-8')]);
 }
 
-/* ── collect the code into project.txt ──────── */
+/* ── collect the code ────────────────────────
+	 The txt lands in KODER_DATA, not in the project: that folder is not
+	 served over the web at all, so this does not depend on an .htaccess
+	 a host might ignore. One file per folder, named after it — collecting
+	 two projects no longer overwrites the first.
+
+	 It used to be written next to the code it collects. Do not go back to
+	 that: the file includes .env and .htaccess by design, and sitting in
+	 a public folder it was one guessed URL away from anyone. */
 case 'collect': {
 		@set_time_limit(120);
 		$root = safe($in['root'] ?? '');
 		if (!is_dir($root)) fail('not a folder');
-		try { out(collect($root, $root . '/' . COLLECT_OUT)); }
+
+		$dir = KODER_DATA . '/collected';
+		if (!is_dir($dir) && !@mkdir($dir, 0700, true)) fail('could not create ' . $dir, 500);
+		$dest = $dir . '/' . basename(rtrim($root, '/')) . '.txt';
+
+		try { $r = collect($root, $dest); }
 		catch (RuntimeException $e) { fail($e->getMessage(), 500); }
+
+		// with KODER_DATA outside KODER_BASE, koder cannot open what it just
+		// wrote: better to say so than to leave a tab failing on its own
+		$r['open'] = inside(realpath($dest) ?: '');
+		out($r);
 }
 
 /* ── check before navigating to the download ── */
