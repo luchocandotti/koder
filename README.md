@@ -1,6 +1,6 @@
 # koder
 
-A code editor that runs **on the server it edits**. Three PHP files for the backend, one JS file and one CSS file for the frontend. No build step, no framework, no database, no `node_modules`. You open a URL, you type a password, and you are editing the site you are standing on — from a phone, from a tablet, from a borrowed laptop, from anything with a browser.
+A code editor that runs **on the server it edits**. A handful of PHP files for the backend, one JS file and one CSS file for the frontend. No build step, no framework, no database, no `node_modules`. You open a URL, you type a password, and you are editing the site you are standing on — from a phone, from a tablet, from a borrowed laptop, from anything with a browser.
 
 It exists because an iPad is not allowed to have a terminal.
 
@@ -42,7 +42,7 @@ wait.php      waiting-for-approval view, no logic
 check.php     the waiting screen's polling endpoint
 auth.php      single-user password, sessions, per-IP backoff, approval requests
 api.php       the file system: one endpoint, ?a=<action>
-collect.php   standalone: folder -> project.txt
+collect.php   standalone: folder -> one txt
 config.php    the handful of install-specific constants
 app.js        the whole client (~2.3k lines, no imports)
 app.css       tokens, layout, themes, CodeMirror theme
@@ -153,13 +153,13 @@ It writes arbitrary files anywhere under `KODER_BASE`. On a PHP host, writing an
 - An append-only approval log in `KODER_DATA/approvals.log` — every request and every approval, with IP, user-agent and time.
 - Anti-CSRF by requiring a custom `X-Koder: 1` header on every mutating request; `GET` can only reach `raw` and `zip`.
 - Path confinement through `realpath()` + prefix check on every single path that comes from the client; archive extraction rejects `..` entries and caps the uncompressed size.
-- `.htaccess` denies direct access to `auth.php`, `login.php`, `head.php`, `wait.php`, `collect.php`, `config.php` and `project.txt`, and writes a deny-all `.htaccess` into the trash folder.
+- `.htaccess` denies direct access to `auth.php`, `login.php`, `head.php`, `wait.php`, `collect.php` and `config.php`, and writes a deny-all `.htaccess` into the trash folder.
 
 **What is not, and you should know before deploying:**
 
 - **The second factor is opt-in and needs something you build.** Out of the box this is still one password.
 - **No rate limit on the API itself**, and the audit log covers logins, not edits. Nothing records which file changed, or to what.
-- **`.htaccess` is Apache/LiteSpeed only.** On nginx those files are served as plain text unless you write the equivalent `location` blocks yourself. `project.txt` in particular is your entire codebase, publicly readable, including any secret you ever hardcoded.
+- **`.htaccess` is Apache/LiteSpeed only.** On nginx those files are served as plain text unless you write the equivalent `location` blocks yourself — `config.php` and the trash folder included.
 - **The collected txt is your whole codebase in one file.** It includes `.env` and `.htaccess` by design. Earlier versions wrote it next to the code, where it was one guessed URL away from anyone — it now goes to `KODER_DATA/collected/`, which is not served over the web at all. Do not move it back into a public folder to make it easier to reach, and delete the old `project.txt` files those earlier versions left behind.
 - **`lint` runs `shell_exec('php -n -l …')`.** The input is a temp file and the path is escaped, but if shelling out at all is unacceptable in your threat model, delete that action — JavaScript checking keeps working without it.
 - **CodeMirror and acorn load from a CDN without Subresource Integrity.** A compromised CDN response is a compromised editor with your session attached. Pinning the version helps; self-hosting the assets helps more. Doing that properly is an open issue and a good first contribution.
@@ -241,8 +241,10 @@ LSP and real IntelliSense. Multi-user and collaboration. Debuggers, terminals, p
 
 ## License
 
-Not chosen yet. AGPL-3.0 is the likely outcome; until a `LICENSE` file is added, treat this as "all rights reserved, ask first".
+AGPL-3.0. See `LICENSE`.
+
+The Affero variant on purpose: koder runs on a server and is used over the network, which plain GPL does not count as distribution. Under AGPL, if you run a modified koder for others, you share the changes — the same deal you got here.
 
 ## Note for anyone upgrading from the Spanish version
 
-Three things were renamed and will not migrate themselves: `recop.php` → `collect.php`, `proyecto.txt` → `project.txt`, and the trash folder `.koder-papelera` → `.koder-trash`. Rescue anything you still want from the old trash before deleting the leftovers by hand. Paths that used to be hardcoded in `api.php` and `auth.php` now come from `config.php`, including the site origin the preview fetches from.
+Two things were renamed and will not migrate themselves: `recop.php` → `collect.php` and the trash folder `.koder-papelera` → `.koder-trash`. The collected txt moved too: it used to be `proyecto.txt` inside the project, and now lands in `KODER_DATA/collected/`. Delete the old ones by hand — they are the exposed copies — and rescue anything you still want from the old trash first. Paths that used to be hardcoded in `api.php` and `auth.php` now come from `config.php`, including the site origin the preview fetches from.
